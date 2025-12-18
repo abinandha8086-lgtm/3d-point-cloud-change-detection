@@ -27,7 +27,7 @@ def test_network(tcfg):
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     # 2. Load pretrained model
-    best_model_path = "/home/abinandha/go2_3d_change/data/best_net.pth"
+    best_model_path = "./best_net.pth"
     ckpt = torch.load(best_model_path, map_location="cpu")
     pretrained_dict = ckpt["model_state_dict"]
 
@@ -128,4 +128,5 @@ def test_network(tcfg):
 
 if __name__ == "__main__":
     test_network(tcfg)
+
 
