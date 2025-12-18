@@ -61,7 +61,7 @@ def main():
     ]
 
     # 2. Load model
-    best_model_path = "/home/abinandha/go2_3d_change/data/best_net.pth"
+    best_model_path = "./best_net.pth"
     ckpt = torch.load(best_model_path, map_location=device)
     net = Siam3DCDNet(tcfg.in_dim, tcfg.out_dim).to(device)
     net.load_state_dict(ckpt["model_state_dict"], strict=False)
