@@ -1,152 +1,91 @@
-import numpy as np
-import torch
 import open3d as o3d
-from sklearn.neighbors import NearestNeighbors
-import sys
+import pyrealsense2 as rs
+import numpy as np
+import os
 
-sys.path.append(".")
-from net import Siam3DCDNet
+# --- PATH INDEPENDENCE LOGIC ---
+# This finds the folder where THIS script is saved
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "depth_captures")
 
-# CONFIGURATION - TUNED FOR SMALL OBJECTS (EARPODS)
-PC1_PATH = "pointcloud_txts/pc_0000.txt"
-PC2_PATH = "pointcloud_txts/pc_0001.txt"
-N_POINTS = 8192  
-# DECREASED: 0.005 means 5mm voxels. This preserves the earpod box shape.
-VOXEL_SIZE = 0.05
-SCALE_CHECK = False
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-def preprocess_point_cloud(path, target_n):
-    # Load raw XYZ data
-    try:
-        raw_data = np.loadtxt(path)[:, :3].astype(np.float32)
-    except Exception as e:
-        print(f"Error loading {path}: {e}")
+def process_video(bag_name):
+    bag_path = os.path.join(DATA_DIR, bag_name)
+    if not os.path.exists(bag_path):
+        print(f"Error: {bag_name} not found in {DATA_DIR}")
         return None
 
-    # DEBUG: Check if data is in meters. If the max value is > 10, it's likely in mm.
-    if np.max(np.abs(raw_data)) > 10.0:
-        raw_data /= 1000.0
-        
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(raw_data)
-
-    # Clean edges and isolate the small object
-   # pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    pcd = pcd.voxel_down_sample(voxel_size=VOXEL_SIZE)
-
-    points = np.asarray(pcd.points)
-    if len(points) == 0:
-        print(f"Warning: {path} resulted in 0 points after preprocessing!")
-        return np.zeros((target_n, 3))
-
-    if len(points) >= target_n:
-        idx = np.random.choice(len(points), target_n, replace=False)
-        points = points[idx]
-    else:
-        idx = np.random.choice(len(points), target_n, replace=True)
-        points = points[idx]
+    print(f"Processing: {bag_name}...")
     
-    return points
+    volume = o3d.pipelines.integration.ScalableTSDFVolume(
+        voxel_length=0.008, sdf_trunc=0.02,
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
 
-def build_pyramid(pc):
-    """
-    Creates the point cloud hierarchy required by the 3DCDNet architecture.
-    """
-    xyz_list, neigh_list, pool_list, up_list = [], [], [], []
-    counts = [8192, 2048, 512, 128, 32] 
+    pipeline = rs.pipeline()
+    config = rs.config()
+    rs.config.enable_device_from_file(config, bag_path, repeat_playback=False)
     
-    curr_pc = pc
-    hierarchy = [pc]
-    for i in range(4):
-        # Downsample by 4 at each level
-        next_pc = curr_pc[::4][:counts[i+1]]
-        hierarchy.append(next_pc)
-        curr_pc = next_pc
+    try:
+        profile = pipeline.start(config)
+        playback = profile.get_device().as_playback()
+        playback.set_real_time(False) 
+    except Exception as e:
+        print(f"Pipeline error: {e}")
+        return None
 
-    for i in range(5):
-        p = hierarchy[i]
-        xyz_list.append(torch.from_numpy(p).float().unsqueeze(0).to(device))
-        
-        # Local neighborhood
-        nn = NearestNeighbors(n_neighbors=16).fit(p)
-        idx = nn.kneighbors(p, return_distance=False)
-        neigh_list.append(torch.from_numpy(idx).long().unsqueeze(0).to(device))
-        
-        if i < 4:
-            # Pooling indices
-            p_idx = torch.arange(len(hierarchy[i+1])).long().view(1, -1, 1).to(device)
-            pool_list.append(p_idx)
+    intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    pinhole = o3d.camera.PinholeCameraIntrinsic(intr.width, intr.height, intr.fx, intr.fy, intr.ppx, intr.ppy)
+    align = rs.align(rs.stream.color)
+
+    curr_pose = np.identity(4)
+    prev_rgbd = None
+
+    try:
+        while True:
+            frames = pipeline.wait_for_frames(2000)
+            aligned = align.process(frames)
             
-            # Upsampling indices for skip connections
-            p_next = hierarchy[i+1]
-            nn_up = NearestNeighbors(n_neighbors=1).fit(p_next)
-            u_idx = nn_up.kneighbors(p, return_distance=False)
-            up_list.append(torch.from_numpy(u_idx).long().unsqueeze(0).to(device))
+            curr_rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                o3d.geometry.Image(np.asanyarray(aligned.get_color_frame().get_data())),
+                o3d.geometry.Image(np.asanyarray(aligned.get_depth_frame().get_data())),
+                depth_scale=1000.0, depth_trunc=2.0, convert_rgb_to_intensity=False)
 
-    return [xyz_list, neigh_list, pool_list, up_list]
+            if prev_rgbd is not None:
+                success, trans, info = o3d.pipelines.odometry.compute_rgbd_odometry(
+                    curr_rgbd, prev_rgbd, pinhole, np.identity(4),
+                    o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
+                    o3d.pipelines.odometry.OdometryOption())
+                if success:
+                    curr_pose = curr_pose @ np.linalg.inv(trans)
 
-# --- MAIN EXECUTION ---
-print("--- Step 1: High-Sensitivity Preprocessing ---")
-pc1 = preprocess_point_cloud(PC1_PATH, N_POINTS)
-pc2 = preprocess_point_cloud(PC2_PATH, N_POINTS)
+            volume.integrate(curr_rgbd, pinhole, curr_pose)
+            prev_rgbd = curr_rgbd
+    except RuntimeError: pass
+    finally: pipeline.stop()
 
-# SIAMESE SETUP
-in0 = build_pyramid(pc1)
-in1 = build_pyramid(pc2)
+    pcd = volume.extract_point_cloud()
+    pcd, _ = pcd.remove_radius_outlier(nb_points=20, radius=0.03)
+    pcd.estimate_normals()
+    return pcd
 
-# Global correspondence (Cross-frame matching)
-nn01 = NearestNeighbors(n_neighbors=1).fit(pc2)
-idx01 = nn01.kneighbors(pc1, return_distance=False)
-nn10 = NearestNeighbors(n_neighbors=1).fit(pc1)
-idx10 = nn10.kneighbors(pc2, return_distance=False)
-k_idx = [torch.from_numpy(idx01).long().unsqueeze(0).to(device), 
-         torch.from_numpy(idx10).long().unsqueeze(0).to(device)]
+if __name__ == "__main__":
+    # Ensure the data directory exists
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
 
-print("--- Step 2: Inference ---")
-model = Siam3DCDNet(3, 64).to(device)
-try:
-    ckpt = torch.load("./outputs/best_weights/best_net.pth", map_location=device)
-    model.load_state_dict(ckpt.get("model_state_dict", ckpt), strict=False)
-except Exception as e:
-    print(f"Weights not found, using random init: {e}")
+    p_ref = process_video("reference_video.bag")
+    p_cur = process_video("current_video.bag")
 
-model.eval()
+    if p_ref and p_cur:
+        # Align and detect
+        reg = o3d.pipelines.registration.registration_icp(
+            p_cur, p_ref, 0.05, np.identity(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPlane())
+        p_cur.transform(reg.transformation)
 
-with torch.no_grad():
-    # out0: Log-probabilities for each point in PC1
-    out0, _ = model(in0, in1, k_idx)
+        dists = np.asarray(p_cur.compute_point_cloud_distance(p_ref))
+        p_cur.paint_uniform_color([0.6, 0.6, 0.6])
+        colors = np.asarray(p_cur.colors)
+        colors[dists > 0.02] = [1, 0, 0] # Red for changes
+        p_cur.colors = o3d.utility.Vector3dVector(colors)
 
-# WE LOWER THE SOFTMAX THRESHOLD TO "SEE" WEAKER CHANGES
-probs = torch.exp(out0[0]) # Convert log_softmax to probability
-change_prob = probs[:, 1].cpu().numpy() # Probability of "change" class
-
-# Threshold: Points with > 35% probability of change are marked red
-pred = (change_prob > 0.90).astype(int) 
-
-print(f"--- SUCCESS! Found {np.sum(pred)} change points ---")
-
-# --- Step 3: Heatmap Visualization ---
-pcd_out = o3d.geometry.PointCloud()
-pcd_out.points = o3d.utility.Vector3dVector(pc1)
-
-# Color logic: Static = Gray, High-Confidence Change = Pure Red, Low-Confidence = Pink/Orange
-colors = np.zeros((len(pc1), 3))
-for i in range(len(pc1)):
-    p = change_prob[i]
-    if pred[i] == 1:
-        # Detected change: Scale from Pink to Red based on confidence
-        colors[i] = [1.0, 1.0 - p, 1.0 - p] 
-    else:
-        # Static environment: Gray
-        colors[i] = [0.6, 0.6, 0.6]
-
-pcd_out.colors = o3d.utility.Vector3dVector(colors)
-
-# Instructions for user
-print("\n[VISUALIZATION]")
-print("- Gray points: Static")
-print("- Red/Pink points:changes")
-print("- Use mouse to rotate, scroll to zoom in close to the table surface.")
-
-o3d.visualization.draw_geometries([pcd_out], window_name="Siam3DCDNet Heatmap")
+        o3d.visualization.draw_geometries([p_cur])
