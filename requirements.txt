@@ -4,3 +4,4 @@ torch
 torchvision
 opencv-python
 scikit-learn
+pyrealsense2
